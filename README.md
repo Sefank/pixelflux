@@ -86,6 +86,12 @@ To test launching programs into this backend simply add `WAYLAND_DISPLAY=wayland
 WAYLAND_DISPLAY=wayland-1 glmark2-es2-wayland -s 1920x1080
 ```
 
+Each display renders at its own `target_fps`, and fresh input may pull its next frame forward:
+half a frame after the last one, a pointer move or a key press is composited and published at
+once, and the cadence then follows the input's phase, so a pointer moving at the client's refresh
+rate is captured as it lands instead of up to a frame later. The frames pulled forward come out
+of a small budget, which keeps the sustained rate within a few percent of `target_fps`.
+
 ### Host capture (external compositors)
 
 Setting `wayland_host_display` to another compositor's socket captures **that** session instead

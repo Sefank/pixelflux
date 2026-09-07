@@ -20,7 +20,7 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gbm::{BufferObject, Device as RawGbmDevice};
 use pyo3::prelude::*;
@@ -217,6 +217,86 @@ pub enum GpuEncoder {
     Nvenc(NvencEncoder),
 }
 
+/// What asks a display for a frame: its frame timer, or fresh input that may pull the
+/// cadence's phase forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickTrigger {
+    Timer,
+    Input,
+}
+
+/// The share of a frame period the timer's tick may run early by, absorbing its wakeup jitter.
+const TIMER_TICK_MIN_FRACTION: f64 = 0.9;
+/// The share of a frame period that has to pass before input may pull the next frame forward.
+const INPUT_TICK_MIN_FRACTION: f64 = 0.5;
+/// The share of wall time that accrues as time input may pull frames forward by. A frame
+/// pulled forward by some time is one the cadence earns that much later, so the sustained
+/// rate can rise above the configured one by at most this share.
+const INPUT_BORROW_REFILL: f64 = 1.0 / 32.0;
+
+/// A capture's frame pacing: the last frame it rendered, and how far input may still pull the
+/// next one forward.
+///
+/// The shared frame timer fires for the earliest due capture; each capture renders on it once
+/// its own period has (nearly) passed. Fresh input may also render a frame: a whole period
+/// after the last one it merely moves the cadence's phase to the input's, and from half a
+/// period on it pulls the frame forward, spending the time it comes early by from a budget
+/// that refills at `INPUT_BORROW_REFILL` and holds half a period at most. A pointer moving at
+/// the client's refresh rate is thus captured as it lands rather than up to a period later --
+/// the cadence locks to the input's phase on the first move and follows it for free -- while
+/// input at a rate the cadence cannot follow raises the output rate by no more than the refill.
+#[derive(Debug, Default)]
+pub struct FramePace {
+    /// Last tick this capture actually rendered.
+    pub last_tick: Option<Instant>,
+    /// The budget left when it was last spent, and when that was; a fresh capture holds the cap.
+    borrow_budget: Option<(Duration, Instant)>,
+}
+
+impl FramePace {
+    /// Whether a capture rendering every `period` is due a frame at `now`, given what asks.
+    pub fn due(&self, trigger: TickTrigger, period: Duration, now: Instant) -> bool {
+        let Some(last) = self.last_tick else { return true };
+        let elapsed = now.saturating_duration_since(last);
+        match trigger {
+            TickTrigger::Timer => elapsed >= period.mul_f64(TIMER_TICK_MIN_FRACTION),
+            TickTrigger::Input => {
+                elapsed >= period
+                    || (elapsed >= period.mul_f64(INPUT_TICK_MIN_FRACTION)
+                        && self.budget(period, now) >= period - elapsed)
+            }
+        }
+    }
+
+    /// Record the frame rendered at `now`.
+    pub fn ticked(&mut self, trigger: TickTrigger, period: Duration, now: Instant) {
+        if trigger == TickTrigger::Input
+            && let Some(last) = self.last_tick
+            && now.saturating_duration_since(last) < period
+        {
+            let borrowed = period - now.saturating_duration_since(last);
+            self.borrow_budget = Some((self.budget(period, now).saturating_sub(borrowed), now));
+        }
+        self.last_tick = Some(now);
+    }
+
+    /// How far input may pull the next frame forward at `now`.
+    fn budget(&self, period: Duration, now: Instant) -> Duration {
+        let cap = period.mul_f64(INPUT_TICK_MIN_FRACTION);
+        match self.borrow_budget {
+            None => cap,
+            Some((left, at)) => {
+                (left + now.saturating_duration_since(at).mul_f64(INPUT_BORROW_REFILL)).min(cap)
+            }
+        }
+    }
+
+    /// When the timer is next due for this capture.
+    pub fn next_due(&self, period: Duration, now: Instant) -> Instant {
+        self.last_tick.map_or(now, |last| last + period)
+    }
+}
+
 /// One capture pipeline bound to one output (display id): its settings, encoder set,
 /// frame pools, delivery thread, and per-stream bookkeeping. Exactly one capture may run per
 /// output; all fields mirror the pipeline strategy documented on [`AppState`], instantiated
@@ -250,9 +330,7 @@ pub struct WlCapture {
     pub frame_counter: u16,
     pub pending_force_idr: bool,
     pub needs_full_render: bool,
-    /// Last tick this capture actually rendered; paces per-display fps under the one
-    /// shared render timer (which fires at the fastest active capture's rate).
-    pub last_tick: Option<Instant>,
+    pub pace: FramePace,
     /// Consecutive zero-copy encode failures; reset by any frame that encodes cleanly.
     /// Reaching `HW_ERROR_RECOVERY_THRESHOLD` triggers recovery.
     pub hw_error_streak: u32,
@@ -2801,5 +2879,87 @@ mod stride_tests {
     #[test]
     fn truncated_buffer_keeps_full_row() {
         assert_eq!(rgba_readback_stride(10, 5, 64), 64 * 4);
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    const PERIOD: Duration = Duration::from_millis(20);
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_fresh_capture_is_due_at_once() {
+        let pace = FramePace::default();
+        let now = Instant::now();
+        assert!(pace.due(TickTrigger::Timer, PERIOD, now));
+        assert!(pace.due(TickTrigger::Input, PERIOD, now));
+        assert_eq!(pace.next_due(PERIOD, now), now);
+    }
+
+    #[test]
+    fn the_timer_ticks_at_its_period_with_jitter_slack() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        pace.ticked(TickTrigger::Timer, PERIOD, base);
+        assert!(!pace.due(TickTrigger::Timer, PERIOD, at(base, 17)));
+        assert!(pace.due(TickTrigger::Timer, PERIOD, at(base, 18)));
+        assert_eq!(pace.next_due(PERIOD, at(base, 5)), at(base, 20));
+    }
+
+    #[test]
+    fn input_pulls_a_frame_forward_from_a_budget_and_the_cadence_follows() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        pace.ticked(TickTrigger::Timer, PERIOD, base);
+        assert!(!pace.due(TickTrigger::Input, PERIOD, at(base, 9)), "under half a period waits for the timer");
+        assert!(pace.due(TickTrigger::Input, PERIOD, at(base, 10)));
+        pace.ticked(TickTrigger::Input, PERIOD, at(base, 10));
+        assert_eq!(pace.next_due(PERIOD, at(base, 10)), at(base, 30), "the cadence follows the input");
+        assert!(!pace.due(TickTrigger::Timer, PERIOD, at(base, 20)), "the old phase's tick is skipped");
+        assert!(!pace.due(TickTrigger::Input, PERIOD, at(base, 25)), "the budget is spent for a second pull");
+        assert!(pace.due(TickTrigger::Input, PERIOD, at(base, 30)), "a whole period on, input takes the due frame");
+        pace.ticked(TickTrigger::Input, PERIOD, at(base, 30));
+        // About 4 ms refilled by now: a pull of 10 ms does not fit, one of 3 ms does.
+        pace.ticked(TickTrigger::Timer, PERIOD, at(base, 120));
+        assert!(!pace.due(TickTrigger::Input, PERIOD, at(base, 130)), "a whole pull needs the whole budget back");
+        assert!(pace.due(TickTrigger::Input, PERIOD, at(base, 137)), "a small pull fits what refilled");
+        pace.ticked(TickTrigger::Input, PERIOD, at(base, 137));
+        pace.ticked(TickTrigger::Timer, PERIOD, at(base, 500));
+        assert!(pace.due(TickTrigger::Input, PERIOD, at(base, 510)), "the budget is whole again");
+    }
+
+    #[test]
+    fn input_faster_than_the_period_raises_the_rate_by_the_refill_at_most() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        let end = base + Duration::from_secs(2);
+        let (mut frames, mut next_input, mut next_timer) = (0, base, base);
+        loop {
+            let t = next_input.min(next_timer);
+            if t >= end {
+                break;
+            }
+            if t == next_timer {
+                if pace.due(TickTrigger::Timer, PERIOD, t) {
+                    pace.ticked(TickTrigger::Timer, PERIOD, t);
+                    frames += 1;
+                }
+                next_timer = pace.next_due(PERIOD, t);
+            }
+            if t == next_input {
+                if pace.due(TickTrigger::Input, PERIOD, t) {
+                    pace.ticked(TickTrigger::Input, PERIOD, t);
+                    frames += 1;
+                    next_timer = pace.next_due(PERIOD, t);
+                }
+                next_input = t + Duration::from_millis(7);
+            }
+        }
+        assert!((100..=104).contains(&frames), "{frames} frames in two seconds at 50 fps");
     }
 }

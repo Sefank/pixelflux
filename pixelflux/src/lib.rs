@@ -400,7 +400,7 @@ use encoders::vaapi::VaapiEncoder;
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 
 use wayland::cursor::{Cursor, CursorJob};
-use wayland::frontend::{AppState, ClientState, FocusTarget, GpuEncoder, next_serial, wayland_time, wayland_utime};
+use wayland::frontend::{AppState, ClientState, FocusTarget, FramePace, GpuEncoder, TickTrigger, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;
@@ -1279,6 +1279,19 @@ const MAX_FPS: f64 = 1000.0;
 /// not drawing frames nobody asked for.
 const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_FPS: f64 = 60.0;
+
+/// The frame period for a target rate. Settings are sanitized at the Python boundary; a rate
+/// outside the sane range takes the default here so a non-finite one never reaches
+/// `Duration::from_secs_f64`.
+fn frame_period(fps: f64) -> Duration {
+    let fps = if fps.is_finite() && fps > 0.0 { fps.min(MAX_FPS) } else { DEFAULT_FPS };
+    Duration::from_secs_f64(1.0 / fps)
+}
+
+/// The frame period a capture renders at.
+fn capture_period(cap: &wayland::frontend::WlCapture) -> Duration {
+    frame_period(cap.settings.target_fps)
+}
 const MAX_SCALE: f64 = 8.0;
 /// Wheel v120 units per unit of injected scroll value: selkies sends 10 per notch, and one
 /// notch is 120, so both the seat's v120 and the host virtual pointer's discrete steps derive
@@ -2579,7 +2592,7 @@ fn start_capture_on_display(
         frame_counter: 0,
         pending_force_idr: false,
         needs_full_render: true,
-        last_tick: None,
+        pace: FramePace::default(),
         hw_error_streak: 0,
         hw_rebuilt: false,
     };
@@ -2935,9 +2948,25 @@ fn wait_render_fence(sync: &SyncPoint, display_id: u32) -> bool {
     reached
 }
 
+/// Render every output that is due for `trigger`, and say whether a readback pool was still
+/// busy. The nodes are taken out of the state so each per-output render can borrow the shared
+/// renderer/space alongside its own damage tracker and buffers.
+fn render_pass(state: &mut AppState, trigger: TickTrigger) -> bool {
+    let mut nodes = std::mem::take(&mut state.output_nodes);
+    let mut any_pool_busy = false;
+    for node in nodes.iter_mut() {
+        if render_node_tick(state, node, trigger) {
+            any_pool_busy = true;
+        }
+    }
+    state.output_nodes = nodes;
+    any_pool_busy
+}
+
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
+    trigger: TickTrigger,
 ) -> bool {
     let take_screenshot = state
         .pending_screenshot
@@ -2948,16 +2977,13 @@ fn render_node_tick(
         return false;
     }
 
-    // Per-display frame pacing under the one shared timer (which fires at the fastest
-    // active capture's rate).
+    // Per-display frame pacing under the one shared timer, and under input.
     if let Some(cap) = node.capture.as_ref()
-        && !take_screenshot {
-            let fps = cap.settings.target_fps.max(1.0);
-            if let Some(last) = cap.last_tick
-                && last.elapsed().as_secs_f64() < (1.0 / fps) * 0.9 {
-                    return false;
-                }
-        }
+        && !take_screenshot
+        && !cap.pace.due(trigger, capture_period(cap), Instant::now())
+    {
+        return false;
+    }
 
     let output = node.output.clone();
     let origin: Point<i32, smithay::utils::Logical> = node.pos.into();
@@ -3055,7 +3081,8 @@ fn render_node_tick(
     node.overlay_state.update_position(width, height, loc_enum);
 
     if let Some(cap) = node.capture.as_mut() {
-        cap.last_tick = Some(Instant::now());
+        let period = capture_period(cap);
+        cap.pace.ticked(trigger, period, Instant::now());
     }
 
     // The cursor is composited only on the output the pointer is on, at that output's
@@ -3392,7 +3419,8 @@ fn render_node_tick(
                                         c.needs_full_render = false;
                                     }
                                 } else {
-                                    // Stalled fence: publish nothing, redraw next tick.
+                                    // The tracker counts the unfinished frame as drawn, so the
+                                    // target is published to nobody and redrawn whole next tick.
                                     render_success = false;
                                     damage_rects.clear();
                                     if let Some(c) = cap.as_deref_mut() {
@@ -4863,11 +4891,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     // captured, only the views cut from it are.
     create_view_on(&mut state, DEFAULT_VIEW_ID, 0, 0, 0, width, height);
 
-    /// Apply every queued control command in FIFO order. Sends wake the loop through the
+    /// Apply every queued control command in FIFO order, and say whether any was input. Sends
+    /// wake the loop through the
     /// separate wake channel, and the render tick ALSO drains before starting its work, so
     /// queued input is applied ahead of a long render/encode instead of waiting it out.
-    fn drain_thread_commands(state: &mut AppState) {
-        let Some(rx) = state.command_rx.take() else { return };
+    fn drain_thread_commands(state: &mut AppState) -> bool {
+        let Some(rx) = state.command_rx.take() else { return false };
         let mut had_input = false;
         while let Ok(cmd) = rx.try_recv() {
             had_input |= matches!(
@@ -4885,6 +4914,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             state.last_input_at = Some(Instant::now());
         }
         state.command_rx = Some(rx);
+        had_input
     }
 
     /// One idle-tick service pass for committed clients while nothing captures:
@@ -5492,7 +5522,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     event_loop
         .handle()
         .insert_source(wake_rx, |_, _, state| {
-            drain_thread_commands(state);
+            let had_input = drain_thread_commands(state);
             // Input landing while the frame timer sits on its long idle
             // deadline must not wait it out: service the frame callbacks now
             // (at most at frame pace) so the app's echo repaint starts with
@@ -5507,6 +5537,15 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             {
                 state.last_idle_service_at = Some(Instant::now());
                 send_idle_frame_callbacks(state);
+            }
+            // Input may pull a capture's due frame forward to its own phase (see
+            // FramePace); host capture frames arrive at the host's pace and cannot.
+            if had_input
+                && state.host.is_none()
+                && state.output_nodes.iter().any(|n| n.capture.is_some())
+            {
+                state.space.refresh();
+                render_pass(state, TickTrigger::Input);
             }
         })
         .unwrap();
@@ -5632,35 +5671,22 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             }
             state.frame_idle_long = false;
 
-            // Render every output that needs it. The nodes are taken out of the state so
-            // each per-output render can borrow the shared renderer/space alongside its
-            // own damage tracker and buffers.
-            let mut nodes = std::mem::take(&mut state.output_nodes);
-            let mut any_pool_busy = false;
-            for node in nodes.iter_mut() {
-                if render_node_tick(state, node) {
-                    any_pool_busy = true;
-                }
-            }
-            state.output_nodes = nodes;
-
-            if any_pool_busy {
+            if render_pass(state, TickTrigger::Timer) {
                 return TimeoutAction::ToDuration(Duration::from_millis(1));
             }
-            let work_elapsed = loop_start_time.elapsed();
-            let max_fps = state
+            // The next fire is the earliest capture's due time, so a frame input pulled
+            // forward carries the cadence with it; with no capture (a screenshot or a
+            // capture client alone) the primary's rate paces from this tick's start.
+            let now = Instant::now();
+            let next_due = state
                 .output_nodes
                 .iter()
-                .filter_map(|n| n.capture.as_ref().map(|c| c.settings.target_fps))
-                .fold(0.0f64, f64::max);
-            let raw_fps = if max_fps > 0.0 { max_fps } else { state.settings.target_fps };
-            // Settings are sanitized at the Python boundary; this final guard keeps a
-            // non-finite value from ever reaching Duration::from_secs_f64 (panics on NaN).
-            let fps = if raw_fps.is_finite() && raw_fps > 0.0 { raw_fps.min(MAX_FPS) } else { DEFAULT_FPS };
-            let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
-            let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
-            let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };
-            TimeoutAction::ToDuration(final_wait)
+                .filter_map(|n| n.capture.as_ref())
+                .map(|cap| cap.pace.next_due(capture_period(cap), now))
+                .min()
+                .unwrap_or(loop_start_time + frame_period(state.settings.target_fps));
+            let wait = next_due.saturating_duration_since(now);
+            TimeoutAction::ToDuration(if wait.as_millis() < 1 { Duration::from_millis(1) } else { wait })
         })
         .expect("Failed to init capture timer");
 
