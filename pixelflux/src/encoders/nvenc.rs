@@ -58,10 +58,6 @@ const EGL_HEIGHT: EGLint = 0x3056;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
 const EGL_NONE: EGLint = 0x3038;
 
-/// Deadline a synchronous NVENC bitstream lock is polled to before the encode is declared
-/// stalled, so a wedged channel cannot hang the compositor thread.
-const NVENC_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Opaque CUDA graphics-resource handle for the EGL interop path — an `EGLImageKHR`
 /// registered with CUDA maps to one of these.
 type CUgraphicsResource = *mut c_void;
@@ -1766,7 +1762,10 @@ impl NvencEncoder {
     /// 1. **Pick an output buffer** from the ring (`current_buffer_idx` advances modulo the ring
     ///    length) and submit the picture with `nvEncEncodePicture`; `force_idr` sets the force-IDR
     ///    pic flag.
-    /// 2. **Lock the bitstream** (`nvEncLockBitstream`, blocking) to read the encoded bytes.
+    /// 2. **Lock the bitstream** (`nvEncLockBitstream`, blocking) to read the encoded bytes. The
+    ///    lock has to block: on Linux a `doNotWait` lock answers an unfinished encode with
+    ///    `NV_ENC_SUCCESS` and an empty bitstream, not `NV_ENC_ERR_LOCK_BUSY`, so polling it would
+    ///    hand out empty frames.
     /// 3. **Frame the output**: unless `omit_stripe_headers` is set, prepend the 10-byte wire header
     ///    — a `0x04` tag, a picture-type byte derived from the *actual* encoded `pictureType`
     ///    (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than the `force_idr` request, the low 16 bits
@@ -1809,25 +1808,11 @@ impl NvencEncoder {
             outputBitstream: output_bitstream,
             ..Default::default()
         };
-        // Sync-mode NVENC has no async completion, so a blocking lock parks this thread
-        // until the GPU finishes -- forever on a wedged channel. Poll a not-ready lock
-        // (doNotWait=1) to a deadline so a stalled encode drops a frame instead.
-        lock_params.set_doNotWait(1);
+        lock_params.set_doNotWait(0);
         let lock_fn = self.nvenc_funcs.nvEncLockBitstream.unwrap();
-        let lock_deadline = std::time::Instant::now() + NVENC_LOCK_TIMEOUT;
-        loop {
-            match lock_fn(self.encoder_session, &mut lock_params) {
-                NVENCSTATUS::NV_ENC_SUCCESS => break,
-                NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY
-                    if std::time::Instant::now() < lock_deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY => {
-                    return Err("Lock Bitstream timed out; encode stalled".into());
-                }
-                other => return Err(format!("Lock Bitstream failed: {other:?}")),
-            }
+        let status = lock_fn(self.encoder_session, &mut lock_params);
+        if status != NVENCSTATUS::NV_ENC_SUCCESS {
+            return Err(format!("Lock Bitstream failed: {status:?}"));
         }
 
         let data_ptr = lock_params.bitstreamBufferPtr as *const u8;
@@ -3025,6 +3010,134 @@ mod gpu_tests {
                 .expect("submit");
             (enc.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         });
+    }
+
+    /// How a bitstream lock waits for the encode: blocking in the driver, spinning on
+    /// `doNotWait` locks, or sleeping between them.
+    #[derive(Clone, Copy, Debug)]
+    enum LockWait {
+        Block,
+        Spin,
+        Sleep(std::time::Duration),
+    }
+
+    /// On a real GPU, the time from `nvEncEncodePicture` to a locked bitstream at 1080p under
+    /// each lock strategy, with the CPU each spends and how many not-ready answers the driver
+    /// gives: the spin marks when the encode really completes, the blocking lock shows what the
+    /// driver's own wait adds, and each sleep interval what its quantization adds. Ignored by
+    /// default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_lock_strategies() {
+        let s = settings(1920, 1080, 60.0);
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let frames = [frame(1920, 1080, 10), frame(1920, 1080, 90)];
+        let n = 240usize;
+        let strategies = [
+            LockWait::Spin,
+            LockWait::Block,
+            LockWait::Sleep(std::time::Duration::from_micros(50)),
+            LockWait::Sleep(std::time::Duration::from_micros(200)),
+            LockWait::Sleep(std::time::Duration::from_micros(1000)),
+        ];
+        for pass in 0..2 {
+            for &strategy in &strategies {
+                let mut waits: Vec<f64> = Vec::with_capacity(n);
+                let mut busy_total = 0u64;
+                let c0 = thread_cpu();
+                for i in 0..n {
+                    let (wait, busy) = unsafe { lock_round_trip(&mut enc, &frames[i % 2], i as u64, strategy) };
+                    waits.push(wait);
+                    busy_total += busy;
+                }
+                let cpu_us = (thread_cpu() - c0).as_secs_f64() * 1e6 / n as f64;
+                waits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = waits.iter().sum::<f64>() / n as f64;
+                let pct = |q: f64| waits[((n as f64 - 1.0) * q) as usize];
+                let empty = EMPTY_SUCCESSES.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if pass == 1 {
+                    println!(
+                        "{strategy:?}: submit->locked mean {mean:.0} us p50 {:.0} p95 {:.0} p99 {:.0} max {:.0}; {cpu_us:.0} us cpu/frame; {:.1} not-ready answers/frame; {:.2} empty successes/frame",
+                        pct(0.5), pct(0.95), pct(0.99), waits[n - 1], busy_total as f64 / n as f64, empty as f64 / n as f64
+                    );
+                }
+            }
+        }
+    }
+
+    /// Successful `doNotWait` locks that came back with an empty bitstream, across the bench.
+    static EMPTY_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Test helper: upload one frame synchronously, submit it, wait for its bitstream with
+    /// `strategy` and unlock it; the wait in microseconds and the not-ready answers seen.
+    unsafe fn lock_round_trip(enc: &mut NvencEncoder, pixels: &[u8], frame_number: u64, strategy: LockWait) -> (f64, u64) {
+        let _ = (enc.cuda.cuCtxPushCurrent_v2)(enc.cuda_context);
+        let copy = CUDA_MEMCPY2D {
+            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
+            srcHost: pixels.as_ptr() as *const c_void,
+            srcPitch: (enc.width * 4) as usize,
+            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstDevice: enc.input_device_ptr,
+            dstPitch: enc.input_pitch,
+            WidthInBytes: (enc.width * 4) as usize,
+            Height: enc.height as usize,
+            ..Default::default()
+        };
+        assert_eq!((enc.cuda.cuMemcpy2D_v2)(&copy), CUresult::CUDA_SUCCESS);
+        let output_bitstream = enc.bitstream_buffers[enc.current_buffer_idx];
+        enc.current_buffer_idx = (enc.current_buffer_idx + 1) % enc.bitstream_buffers.len();
+        let mut pic_params = NV_ENC_PIC_PARAMS {
+            version: sv(NvStruct::PicParams),
+            inputWidth: enc.width,
+            inputHeight: enc.height,
+            inputBuffer: enc.mapped_input_buffer,
+            outputBitstream: output_bitstream,
+            bufferFmt: enc.input_format,
+            pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
+            encodePicFlags: if frame_number == 0 { NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32 } else { 0 },
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let st = (enc.nvenc_funcs.nvEncEncodePicture.unwrap())(enc.encoder_session, &mut pic_params);
+        assert_eq!(st, NVENCSTATUS::NV_ENC_SUCCESS);
+        let mut lock_params = NV_ENC_LOCK_BITSTREAM {
+            version: sv(NvStruct::LockBitstream),
+            outputBitstream: output_bitstream,
+            ..Default::default()
+        };
+        lock_params.set_doNotWait(matches!(strategy, LockWait::Block).then_some(0).unwrap_or(1));
+        let lock_fn = enc.nvenc_funcs.nvEncLockBitstream.unwrap();
+        let mut busy = 0u64;
+        let mut empty_successes = 0u64;
+        loop {
+            match lock_fn(enc.encoder_session, &mut lock_params) {
+                NVENCSTATUS::NV_ENC_SUCCESS if lock_params.bitstreamSizeInBytes > 0 => break,
+                NVENCSTATUS::NV_ENC_SUCCESS => {
+                    empty_successes += 1;
+                    (enc.nvenc_funcs.nvEncUnlockBitstream.unwrap())(enc.encoder_session, output_bitstream);
+                    if let LockWait::Sleep(d) = strategy {
+                        std::thread::sleep(d);
+                    }
+                    if matches!(strategy, LockWait::Block) {
+                        panic!("blocking lock returned an empty bitstream");
+                    }
+                }
+                NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY => {
+                    busy += 1;
+                    if let LockWait::Sleep(d) = strategy {
+                        std::thread::sleep(d);
+                    }
+                }
+                other => panic!("lock failed: {other:?}"),
+            }
+        }
+        let wait = t0.elapsed().as_secs_f64() * 1e6;
+        if empty_successes > 0 {
+            EMPTY_SUCCESSES.fetch_add(empty_successes, std::sync::atomic::Ordering::Relaxed);
+        }
+        (enc.nvenc_funcs.nvEncUnlockBitstream.unwrap())(enc.encoder_session, output_bitstream);
+        (enc.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        (wait, busy)
     }
 }
 
