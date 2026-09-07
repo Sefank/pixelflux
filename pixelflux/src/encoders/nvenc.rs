@@ -1355,37 +1355,36 @@ impl NvencEncoder {
         }
     }
 
-    /// The session's current encode resolution, so a caller can skip a no-op reconfigure:
-    /// resetting an unchanged session mid-flight during a resize burst can wedge the encoder.
-    pub fn current_resolution(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// Resize the live session to `settings` in place, folding in the current rate / QP /
-    /// fps, without tearing it down.
+    /// Follow a capture restart on the live session, folding in the current rate / QP / fps,
+    /// without tearing it down.
     ///
-    /// The NVENC session, CUDA context and bitstream buffers survive, so a resize costs a few
+    /// The NVENC session, CUDA context and bitstream buffers survive, so a restart costs a few
     /// milliseconds instead of a full rebuild. Flow:
     ///
     /// 1. **Reject the unchangeable**: a different encode device, a chroma-format flip (4:4:4), an
     ///    RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode` headroom all return
     ///    `Err` so the caller rebuilds. Chroma and RC mode are read back from the live
     ///    `encode_config` (the H.264 arm of the codec-config union is the one this encoder fills).
-    /// 2. **Release geometry-dependent state** under the pushed CUDA context: unmap / unregister /
+    /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface and
+    ///    the dmabuf imports stay as they are, so the restart costs no IDR and no reset. Only the
+    ///    pinned hosts are dropped -- the restart recreates the source buffers, often at the same
+    ///    addresses -- and the rate, frame rate and wire framing the restart carries are folded
+    ///    in, as `reconfigure_rate` does. Returns `Ok(false)`.
+    /// 3. **Release geometry-dependent state** under the pushed CUDA context: unmap / unregister /
     ///    free the packed input surface, the raw-plane buffer, every cached dmabuf import (with
     ///    the NVENC registration a direct import holds), and every pinned
     ///    host. The raw-plane buffer and dmabuf imports are re-created lazily by their encode paths;
     ///    pinned hosts are dropped because the source shm segments are recreated on resize and may
     ///    reuse the same base addresses.
-    /// 3. **Reconfigure the session**: update the level for the new size, the CBR bitrate + VBV or
+    /// 4. **Reconfigure the session**: update the level for the new size, the CBR bitrate + VBV or
     ///    the ConstQP, and the new dimensions / DAR / frame rate, then `NvEncReconfigureEncoder` with
     ///    `resetEncoder` and `forceIDR` so the stream restarts cleanly at the new size. Driver
     ///    rejection returns `Err`.
-    /// 4. **Reallocate the packed input** at the new size and register + map it as init does, in
+    /// 5. **Reallocate the packed input** at the new size and register + map it as init does, in
     ///    the byte order the session was last fed.
     ///
-    /// On success the next encoded frame is a reset-RC IDR.
-    pub fn reconfigure_resolution(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
+    /// On a resize the next encoded frame is a reset-RC IDR and `Ok(true)` is returned.
+    pub fn reconfigure_resolution(&mut self, settings: &RustCaptureSettings) -> Result<bool, String> {
         let new_w = settings.width as u32;
         let new_h = settings.height as u32;
         let is_444 =
@@ -1410,6 +1409,12 @@ impl NvencEncoder {
                 "{}x{} outside reconfigure headroom {}x{}",
                 new_w, new_h, self.init_params.maxEncodeWidth, self.init_params.maxEncodeHeight
             ));
+        }
+        if (new_w, new_h) == (self.width, self.height) {
+            self.release_pinned_hosts();
+            self.reconfigure_rate(settings);
+            self.omit_stripe_headers = settings.omit_stripe_headers;
+            return Ok(false);
         }
 
         unsafe {
@@ -1550,7 +1555,7 @@ impl NvencEncoder {
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
         self.omit_stripe_headers = settings.omit_stripe_headers;
-        Ok(())
+        Ok(true)
     }
 
     /// Page-lock one host upload source's base address once, under the already-current CUDA
@@ -2498,20 +2503,33 @@ mod gpu_tests {
             stream.extend_from_slice(&pkt[10..]);
         }
 
+        assert_eq!(
+            enc.reconfigure_resolution(&s).expect("same-size reconfigure"),
+            false,
+            "unchanged dimensions must not reset the session"
+        );
+        let pkt = enc
+            .encode_cpu_argb(&f720, 1280 * 4, 5, 25, false)
+            .expect("encode after same-size reconfigure");
+        assert_eq!(pkt[1], 0x00, "the stream continues without an IDR at unchanged dimensions");
+        assert!(pkt.len() > 10, "a locked bitstream carries the encoded picture");
+        stream.extend_from_slice(&pkt[10..]);
+
         s.width = 1920;
         s.height = 1080;
         let t1 = std::time::Instant::now();
-        enc.reconfigure_resolution(&s).expect("grow reconfigure");
+        assert!(enc.reconfigure_resolution(&s).expect("grow reconfigure"));
         let grow_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let f1080 = frame(1920, 1080, 40);
         let pkt = enc
-            .encode_cpu_argb(&f1080, 1920 * 4, 5, 25, false)
+            .encode_cpu_argb(&f1080, 1920 * 4, 6, 25, false)
             .expect("encode 1080p");
         assert_eq!(pkt[0], 0x04);
         assert_eq!(pkt[1], 0x01, "first frame after a resize must be an IDR");
         assert_eq!(wire_dims(&pkt), (1920, 1080));
+        assert!(pkt.len() > 10, "a locked bitstream carries the encoded picture");
         stream.extend_from_slice(&pkt[10..]);
-        for i in 6..10u64 {
+        for i in 7..10u64 {
             let pkt = enc
                 .encode_cpu_argb(&f1080, 1920 * 4, i, 25, false)
                 .expect("encode 1080p");
@@ -2522,7 +2540,7 @@ mod gpu_tests {
         s.width = 640;
         s.height = 480;
         let t2 = std::time::Instant::now();
-        enc.reconfigure_resolution(&s).expect("shrink reconfigure");
+        assert!(enc.reconfigure_resolution(&s).expect("shrink reconfigure"));
         let shrink_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let f480 = frame(640, 480, 70);
         let pkt = enc

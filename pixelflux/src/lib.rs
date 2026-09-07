@@ -1358,13 +1358,11 @@ fn build_readback_encoders(
     );
     if driver_selects_nvenc(&encode_driver) {
         if let Some(GpuEncoder::Nvenc(mut enc)) = prior {
-            // Skip the reset when the resolution is unchanged (see the zero-copy path).
-            if enc.current_resolution() == (settings.width as u32, settings.height as u32) {
-                return Some(GpuEncoder::Nvenc(enc));
-            }
             match enc.reconfigure_resolution(settings) {
-                Ok(()) => {
-                    println!("[Wayland] NVENC session reconfigured in place.");
+                Ok(resized) => {
+                    if resized {
+                        println!("[Wayland] NVENC session reconfigured in place.");
+                    }
                     return Some(GpuEncoder::Nvenc(enc));
                 }
                 Err(e) => eprintln!(
@@ -2432,25 +2430,19 @@ fn start_capture_on_display(
         );
 
         if driver_selects_nvenc(&encode_driver) {
-            // Reconfigure only when the resolution changed: a layout pass restarts every live
-            // capture, and resetting an untouched sibling mid-burst can wedge the encoder.
             let reused = match prior_zero_copy.as_mut() {
-                Some(GpuEncoder::Nvenc(enc)) => {
-                    if enc.current_resolution() == (settings.width as u32, settings.height as u32) {
-                        true
-                    } else {
-                        match enc.reconfigure_resolution(&settings) {
-                            Ok(()) => {
-                                println!("[Wayland] NVENC session reconfigured in place.");
-                                true
-                            }
-                            Err(e) => {
-                                eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
-                                false
-                            }
+                Some(GpuEncoder::Nvenc(enc)) => match enc.reconfigure_resolution(&settings) {
+                    Ok(resized) => {
+                        if resized {
+                            println!("[Wayland] NVENC session reconfigured in place.");
                         }
+                        true
                     }
-                }
+                    Err(e) => {
+                        eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
+                        false
+                    }
+                },
                 _ => false,
             };
             if reused {
