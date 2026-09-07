@@ -58,6 +58,10 @@ const EGL_HEIGHT: EGLint = 0x3056;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
 const EGL_NONE: EGLint = 0x3038;
 
+/// Deadline a synchronous NVENC bitstream lock is polled to before the encode is declared
+/// stalled, so a wedged channel cannot hang the compositor thread.
+const NVENC_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Opaque CUDA graphics-resource handle for the EGL interop path — an `EGLImageKHR`
 /// registered with CUDA maps to one of these.
 type CUgraphicsResource = *mut c_void;
@@ -1355,6 +1359,12 @@ impl NvencEncoder {
         }
     }
 
+    /// The session's current encode resolution, so a caller can skip a no-op reconfigure:
+    /// resetting an unchanged session mid-flight during a resize burst can wedge the encoder.
+    pub fn current_resolution(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Resize the live session to `settings` in place, folding in the current rate / QP /
     /// fps, without tearing it down.
     ///
@@ -1799,11 +1809,25 @@ impl NvencEncoder {
             outputBitstream: output_bitstream,
             ..Default::default()
         };
-        lock_params.set_doNotWait(0);
-
+        // Sync-mode NVENC has no async completion, so a blocking lock parks this thread
+        // until the GPU finishes -- forever on a wedged channel. Poll a not-ready lock
+        // (doNotWait=1) to a deadline so a stalled encode drops a frame instead.
+        lock_params.set_doNotWait(1);
         let lock_fn = self.nvenc_funcs.nvEncLockBitstream.unwrap();
-        if lock_fn(self.encoder_session, &mut lock_params) != NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err("Lock Bitstream failed".into());
+        let lock_deadline = std::time::Instant::now() + NVENC_LOCK_TIMEOUT;
+        loop {
+            match lock_fn(self.encoder_session, &mut lock_params) {
+                NVENCSTATUS::NV_ENC_SUCCESS => break,
+                NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY
+                    if std::time::Instant::now() < lock_deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY => {
+                    return Err("Lock Bitstream timed out; encode stalled".into());
+                }
+                other => return Err(format!("Lock Bitstream failed: {other:?}")),
+            }
         }
 
         let data_ptr = lock_params.bitstreamBufferPtr as *const u8;

@@ -1358,6 +1358,10 @@ fn build_readback_encoders(
     );
     if driver_selects_nvenc(&encode_driver) {
         if let Some(GpuEncoder::Nvenc(mut enc)) = prior {
+            // Skip the reset when the resolution is unchanged (see the zero-copy path).
+            if enc.current_resolution() == (settings.width as u32, settings.height as u32) {
+                return Some(GpuEncoder::Nvenc(enc));
+            }
             match enc.reconfigure_resolution(settings) {
                 Ok(()) => {
                     println!("[Wayland] NVENC session reconfigured in place.");
@@ -2428,17 +2432,25 @@ fn start_capture_on_display(
         );
 
         if driver_selects_nvenc(&encode_driver) {
+            // Reconfigure only when the resolution changed: a layout pass restarts every live
+            // capture, and resetting an untouched sibling mid-burst can wedge the encoder.
             let reused = match prior_zero_copy.as_mut() {
-                Some(GpuEncoder::Nvenc(enc)) => match enc.reconfigure_resolution(&settings) {
-                    Ok(()) => {
-                        println!("[Wayland] NVENC session reconfigured in place.");
+                Some(GpuEncoder::Nvenc(enc)) => {
+                    if enc.current_resolution() == (settings.width as u32, settings.height as u32) {
                         true
+                    } else {
+                        match enc.reconfigure_resolution(&settings) {
+                            Ok(()) => {
+                                println!("[Wayland] NVENC session reconfigured in place.");
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
+                                false
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
-                        false
-                    }
-                },
+                }
                 _ => false,
             };
             if reused {
@@ -2822,11 +2834,12 @@ fn service_copy_frames(
                 // ready() promises readable contents, and implicit dmabuf sync cannot
                 // be relied on cross-process on every driver: wait out the blit fence
                 // (microseconds) before declaring the frame done.
-                renderer
+                let sync = renderer
                     .blit(&src, &mut dst, full, full, TextureFilter::Linear)
-                    .map_err(|e| format!("{e:?}"))?
-                    .wait()
-                    .map_err(|_| "blit fence interrupted".to_string())?;
+                    .map_err(|e| format!("{e:?}"))?;
+                if !wait_render_fence(&sync, node.id) {
+                    return Err("blit fence not signaled".to_string());
+                }
                 Ok(())
             })(),
             Some(BufferType::Shm) => (|| {
@@ -2900,6 +2913,56 @@ fn cursor_surface_hotspot(
             .and_then(|attrs| attrs.lock().ok().map(|guard| guard.hotspot))
             .unwrap_or_default()
     })
+}
+
+/// Longest a render tick waits for the GPU to finish a frame before giving that frame up.
+const RENDER_FENCE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Wait, bounded, for a render's fence to signal before the tick reuses or releases the
+/// buffers it sampled.
+///
+/// A client buffer a render read can be released and destroyed by the client's next commit
+/// (a nested session swaps its swapchain across a mode change); without implicit dmabuf
+/// fencing the driver then frees it under an unfinished read and faults the channel, after
+/// which no fence of the context signals. The bound turns that into a logged, dropped frame
+/// rather than a compositor thread parked forever in `eglClientWaitSync`. A fence-less sync
+/// point is reached at once.
+fn wait_render_fence(sync: &SyncPoint, display_id: u32) -> bool {
+    let deadline = Instant::now() + RENDER_FENCE_TIMEOUT;
+    let reached = match sync.export() {
+        Some(fd) => {
+            use std::os::fd::AsRawFd as _;
+            let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
+                if rc > 0 {
+                    break true;
+                }
+                let interrupted = rc < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+                if !interrupted || Instant::now() >= deadline {
+                    break sync.is_reached();
+                }
+            }
+        }
+        None => loop {
+            if sync.is_reached() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        },
+    };
+    if !reached {
+        eprintln!(
+            "[Wayland] Display {display_id}: render fence not signaled within {:?}; frame dropped.",
+            RENDER_FENCE_TIMEOUT
+        );
+    }
+    reached
 }
 
 fn render_node_tick(
@@ -3045,6 +3108,7 @@ fn render_node_tick(
 
     let mut render_success = false;
     let mut render_sync = None;
+    let mut gpu_stalled = false;
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(!node.target_seeded);
 
@@ -3350,9 +3414,16 @@ fn render_node_tick(
                                 if let Some(damage) = result.damage {
                                     damage_rects = damage.clone();
                                 }
-                                render_sync = Some(result.sync);
-                                if let Some(c) = cap.as_deref_mut() {
-                                    c.needs_full_render = false;
+                                if wait_render_fence(&result.sync, node.id) {
+                                    render_sync = Some(result.sync);
+                                    if let Some(c) = cap.as_deref_mut() {
+                                        c.needs_full_render = false;
+                                    }
+                                } else {
+                                    // Stalled fence: publish nothing, redraw next tick.
+                                    render_success = false;
+                                    damage_rects.clear();
+                                    gpu_stalled = true;
                                 }
                             },
                             Err(e) => eprintln!("Render error: {:?}", e)
@@ -3657,15 +3728,18 @@ fn render_node_tick(
                     is_animated,
                     requested_idr,
                 );
-                let send_frame = decision.send;
+                let mut send_frame = decision.send && !gpu_stalled;
                 let force_idr = decision.force_idr;
                 let target_qp = decision.target_qp;
 
                 let mut frame_out = false;
+                if send_frame
+                    && let Some(sync) = render_sync.take()
+                    && !wait_render_fence(&sync, node.id)
+                {
+                    send_frame = false;
+                }
                 if send_frame {
-                    if let Some(sync) = render_sync.take() {
-                        let _ = sync.wait();
-                    }
                     // Host-capture frames encode from the buffer the host blitted
                     // into; otherwise from this display's own composited buffer.
                     let enc_dmabuf: Option<Dmabuf> = host_enc_dmabuf
