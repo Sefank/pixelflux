@@ -3298,7 +3298,11 @@ fn render_node_tick(
     if !host_mode && state.use_gpu {
         if let Some(renderer) = state.gles_renderer.as_mut() {
             let mut cap = node.capture.as_mut();
-            if let Some((_bo, dmabuf)) = node.offscreen_buffer.as_mut() {
+            // A screen resized ahead of the capture restart that follows has a target for the
+            // frame the restart will ask for, not for this one.
+            if let Some((bo, dmabuf)) = node.offscreen_buffer.as_mut()
+                && (bo.width() as i32, bo.height() as i32) == (width, height)
+            {
                 let render_age = if node.overlay_state.is_animated() || needs_full { 0 } else { 1 };
                 match renderer.bind(dmabuf) {
                     Ok(mut frame) => {
