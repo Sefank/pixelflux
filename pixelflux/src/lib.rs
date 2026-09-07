@@ -74,6 +74,7 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::backend::egl::fence::EGLFence;
 use smithay::{
     backend::{
         allocator::{
@@ -2917,36 +2918,13 @@ const RENDER_FENCE_TIMEOUT: Duration = Duration::from_millis(500);
 /// (a nested session swaps its swapchain across a mode change); without implicit dmabuf
 /// fencing the driver then frees it under an unfinished read and faults the channel, after
 /// which no fence of the context signals. The bound turns that into a logged, dropped frame
-/// rather than a compositor thread parked forever in `eglClientWaitSync`. A fence-less sync
+/// rather than a compositor thread parked forever. The wait is one `eglClientWaitSync` to the
+/// deadline, flushing whatever commands still queue ahead of the fence; a fence-less sync
 /// point is reached at once.
 fn wait_render_fence(sync: &SyncPoint, display_id: u32) -> bool {
-    let deadline = Instant::now() + RENDER_FENCE_TIMEOUT;
-    let reached = match sync.export() {
-        Some(fd) => {
-            use std::os::fd::AsRawFd as _;
-            let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
-                if rc > 0 {
-                    break true;
-                }
-                let interrupted = rc < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
-                if !interrupted || Instant::now() >= deadline {
-                    break sync.is_reached();
-                }
-            }
-        }
-        None => loop {
-            if sync.is_reached() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_micros(100));
-        },
+    let reached = match sync.get::<EGLFence>() {
+        Some(fence) => fence.client_wait(Some(RENDER_FENCE_TIMEOUT), true).unwrap_or(false),
+        None => sync.wait().is_ok(),
     };
     if !reached {
         eprintln!(
@@ -3100,7 +3078,6 @@ fn render_node_tick(
 
     let mut render_success = false;
     let mut render_sync = None;
-    let mut gpu_stalled = false;
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(!node.target_seeded);
 
@@ -3407,7 +3384,6 @@ fn render_node_tick(
                                     damage_rects = damage.clone();
                                 }
                                 if wait_render_fence(&result.sync, node.id) {
-                                    render_sync = Some(result.sync);
                                     if let Some(c) = cap.as_deref_mut() {
                                         c.needs_full_render = false;
                                     }
@@ -3415,7 +3391,9 @@ fn render_node_tick(
                                     // Stalled fence: publish nothing, redraw next tick.
                                     render_success = false;
                                     damage_rects.clear();
-                                    gpu_stalled = true;
+                                    if let Some(c) = cap.as_deref_mut() {
+                                        c.needs_full_render = true;
+                                    }
                                 }
                             },
                             Err(e) => eprintln!("Render error: {:?}", e)
@@ -3720,7 +3698,7 @@ fn render_node_tick(
                     is_animated,
                     requested_idr,
                 );
-                let mut send_frame = decision.send && !gpu_stalled;
+                let mut send_frame = decision.send;
                 let force_idr = decision.force_idr;
                 let target_qp = decision.target_qp;
 
