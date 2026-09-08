@@ -108,6 +108,12 @@ many outputs: `ScreenCapture.output_capacity()` reports the host's output count 
 self-compositing, where outputs are created on demand), and `create_output` refuses ids the
 host cannot back rather than minting an output that would never receive a frame.
 
+A capture's size is asked of the host through `wlr-output-management`, but what it captures is
+the mode the host ends up running. A host that refuses the request, offers no layout management
+(KWin), or acknowledges a mode it never applies (Hyprland) has the capture re-sized to the mode
+it announces, which `get_realized_geometry` reports and `capture_state` carries as a caveat, so
+an output with a fixed mode list streams at its own resolution instead of never converging.
+
 The built-in compositor also **serves** `ext-image-copy-capture-v1` (with per-output sources),
 so standard capture tools — or another pixelflux — can record a pixelflux session: dmabuf
 clients are filled by one GPU blit from the composited frame, shm clients by one readback, and
