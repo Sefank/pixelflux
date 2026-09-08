@@ -640,9 +640,9 @@ pub struct AppState {
     /// frames arrive by screencopy and input routes to its virtual devices.
     pub host: Option<crate::wayland::host::HostSession>,
     /// Per display, the layout request the host has not answered yet. A capture start
-    /// submits its mode and carries on at that size; the render tick polls the verdict
-    /// and re-sizes the capture to the host's own mode when the host kept it. Emptied
-    /// with the host session.
+    /// submits its mode and carries on at that size; the render tick waits for the host to
+    /// answer, then re-sizes the capture to the mode the host announces. Emptied with the
+    /// host session.
     pub host_layout_pending: std::collections::HashMap<u32, PendingHostLayout>,
 
     pub current_cursor_icon: Option<CursorImageStatus>,

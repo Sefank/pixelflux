@@ -254,9 +254,8 @@ impl LayoutLedger {
     }
 }
 
-/// Bound for one layout application on the control thread: a host that has not
-/// answered by then counts as having kept its own mode, which the session then
-/// follows, the way a refusal is handled.
+/// Bound for one layout application on the control thread: a host that has not answered by
+/// then is settled without it, and the session follows whatever mode the host announces.
 pub const LAYOUT_DEADLINE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -967,12 +966,13 @@ impl HostSession {
         epoch
     }
 
-    /// The host's verdict on the layout request `epoch` (as returned by
-    /// [`start_capture`]): `Some(true)` once the host applied it, `Some(false)`
-    /// once it kept its own modes (refusal, no layout management at all — KWin —
-    /// or no answer within `LAYOUT_DEADLINE`), `None` while still unanswered.
-    /// Never blocks; the caller polls it from its own loop and, on `Some(false)`,
-    /// compares [`current_output_size`] with what it asked for.
+    /// The host's answer to the layout request `epoch` (as returned by [`start_capture`]):
+    /// `Some(true)` once the host said it applied the request, `Some(false)` once it said it
+    /// did not (refusal, no layout management at all — KWin — or no answer within
+    /// `LAYOUT_DEADLINE`), `None` while still unanswered. Never blocks. Which of the two it
+    /// is settles nothing on its own, since a host may acknowledge a mode it did not take:
+    /// the caller polls for either answer, then compares [`current_output_size`] with what
+    /// it asked for.
     pub fn layout_outcome(&self, epoch: u64) -> Option<bool> {
         self.layouts.lock().unwrap().outcome(epoch)
     }
@@ -1355,13 +1355,13 @@ fn control_loop(
     }
 }
 
-/// Ask the host (wlr-output-management) to give every active output its wanted
-/// mode and layout position in one atomic configuration. Retries across a
-/// `cancelled` (stale serial). Returns whether the host realized the layout:
-/// on `false` (refusal, no answer by `LAYOUT_DEADLINE`, or no manager at all —
-/// KWin offers only its own kde_output_management protocol) the session owner
-/// re-sizes its capture to the host's actual mode so capture follows the host
-/// instead of gating forever on a size it will never produce.
+/// Ask the host (wlr-output-management) to give every active output its wanted mode and
+/// layout position in one atomic configuration. Retries across a `cancelled` (stale serial).
+/// Returns whether the host said it applied the layout: `false` for a refusal, no answer by
+/// `LAYOUT_DEADLINE`, or no manager at all (KWin offers only its own kde_output_management
+/// protocol). Either answer settles the request, and the session owner then re-sizes its
+/// capture to the mode the host announces, so capture follows the host instead of gating
+/// forever on a size it will never produce.
 fn apply_layout(
     conn: &Connection,
     queue: &mut EventQueue<CtrlState>,

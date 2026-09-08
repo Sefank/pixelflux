@@ -1976,29 +1976,25 @@ fn answer_geometry_waiters(
     }
 }
 
-/// What the host's verdict on a layout request means for a capture configured at `want`:
-/// `Some(size)` when it has to be re-sized to the mode the host kept (the request was
-/// declined and the host runs a different size), `None` when nothing changes — the host
-/// applied the request, already runs that size, or its mode is unknown (the capture keeps
-/// gating on the size it asked for).
-fn host_layout_resolution(
-    realized: bool,
-    want: (i32, i32),
-    current: Option<(i32, i32)>,
-) -> Option<(i32, i32)> {
-    if realized {
-        return None;
-    }
+/// What the mode a host announced means for a capture configured at `want`, once the host
+/// has ruled on the layout request: `Some(size)` when the capture must follow a different
+/// mode the host runs, `None` when nothing changes — the host runs the requested size, or
+/// its mode is unknown and the capture keeps gating on the size it asked for. The verdict
+/// itself is not consulted: a host may answer `succeeded` for a mode it did not take
+/// (Hyprland acknowledges a custom mode it rejected), so the announced size decides. It has
+/// arrived by the time any verdict does, both riding the one host connection in order.
+fn host_layout_resolution(want: (i32, i32), current: Option<(i32, i32)>) -> Option<(i32, i32)> {
     current.filter(|&c| c != want)
 }
 
-/// Settle the host layout requests answered since the last tick. One the host applied
-/// needs nothing: the capture was configured for that size and its frames flow as the
-/// host switches. One the host kept its own mode against (declined, no layout
-/// management, no answer by the deadline) re-sizes the capture to that mode through the
-/// same in-place reconfigure a resize takes, so it never gates on a size the host will
-/// not produce, and the refusal becomes the capture's caveat. Geometry readers parked
-/// behind a request answer once it is settled, with the size actually captured.
+/// Settle the host layout requests answered since the last tick, against the mode each host
+/// announced. A host already running the requested size needs nothing: the capture was
+/// configured for it and its frames flow. A host running anything else — a request it
+/// refused, acknowledged without applying, or never answered by the deadline, and a host
+/// with no layout management at all — has the capture re-sized to that mode through the same
+/// in-place reconfigure a resize takes, so it never gates on a size the host will not
+/// produce, and the mismatch becomes the capture's caveat. Geometry readers parked behind a
+/// request answer once it is settled, with the size actually captured.
 fn reconcile_host_layouts(state: &mut AppState) {
     if state.host_layout_pending.is_empty() {
         return;
@@ -2007,17 +2003,17 @@ fn reconcile_host_layouts(state: &mut AppState) {
     for id in ids {
         // An earlier iteration's restart may have reaped the host (and every request).
         let Some(pending) = state.host_layout_pending.get(&id) else { continue };
-        let verdict = match state.host.as_ref() {
+        let host_mode = match state.host.as_ref() {
             Some(host) => match host.layout_outcome(pending.epoch) {
+                // Unanswered: the host has not ruled, so its announced mode may still be
+                // the one from before the request.
                 None => continue,
-                Some(realized) => {
-                    host_layout_resolution(realized, pending.want, host.current_output_size(id))
-                }
+                Some(_) => host_layout_resolution(pending.want, host.current_output_size(id)),
             },
             None => None,
         };
         let Some(pending) = state.host_layout_pending.remove(&id) else { continue };
-        if let Some((rw, rh)) = verdict {
+        if let Some((rw, rh)) = host_mode {
             let (w, h) = pending.want;
             let restart = state
                 .node_idx_for_id(id)
@@ -2031,16 +2027,16 @@ fn reconcile_host_layouts(state: &mut AppState) {
                 let followed = if settings.output_mode == 1 { (rw & !1, rh & !1) } else { (rw, rh) };
                 if followed != (w, h) {
                     eprintln!(
-                        "[HostCapture] host kept {rw}x{rh} for display {id} ({w}x{h} declined); capturing at that size."
+                        "[HostCapture] host runs {rw}x{rh} for display {id} ({w}x{h} not applied); capturing at that size."
                     );
                     start_capture_on_display(state, id, cb, settings);
-                    let refusal = format!("host kept {rw}x{rh} ({w}x{h} declined)");
+                    let mismatch = format!("host runs {rw}x{rh} ({w}x{h} not applied)");
                     let own = wayland_capture_err().lock().unwrap().get(&id).cloned();
                     set_wayland_capture_err(
                         id,
                         Some(match own {
-                            Some(e) => format!("{refusal}; {e}"),
-                            None => refusal,
+                            Some(e) => format!("{mismatch}; {e}"),
+                            None => mismatch,
                         }),
                     );
                 }
@@ -8075,24 +8071,24 @@ mod capture_state_tests {
 
 #[cfg(test)]
 mod host_layout_tests {
-    //! How a host's verdict on a layout request resolves for the capture configured at the
-    //! requested size: applied or already current -> nothing to do; kept a different mode
-    //! -> follow it; mode unknown -> keep gating on the request.
+    //! How the mode a host announced resolves for a capture configured at the requested
+    //! size: that size, or no mode at all -> nothing to do; any other mode -> follow it,
+    //! whatever the host answered about the request.
     use super::host_layout_resolution;
 
     #[test]
-    fn verdict_resolves_to_a_follow_size_only_when_the_host_kept_another_mode() {
+    fn the_capture_follows_the_mode_the_host_runs() {
         let want = (1920, 1080);
-        // Applied: nothing changes, whatever the (possibly not yet announced) mode reads.
-        assert_eq!(host_layout_resolution(true, want, Some((1280, 720))), None);
-        assert_eq!(host_layout_resolution(true, want, None), None);
-        // Declined but already at the requested size (a re-assertion on a host without
-        // layout management): converged.
-        assert_eq!(host_layout_resolution(false, want, Some(want)), None);
-        // Declined and running something else: the capture follows the host.
-        assert_eq!(host_layout_resolution(false, want, Some((2560, 1440))), Some((2560, 1440)));
-        // Declined with no mode known: nothing to follow, the request stands.
-        assert_eq!(host_layout_resolution(false, want, None), None);
+        // Running the requested size: converged.
+        assert_eq!(host_layout_resolution(want, Some(want)), None);
+        // No mode announced: nothing to follow, the request stands.
+        assert_eq!(host_layout_resolution(want, None), None);
+        // Running another mode: the capture follows the host. This covers a host that
+        // refused the request and one that acknowledged it without applying it, which
+        // reads identically here and is what keeps a fixed-mode host from renegotiating
+        // with a resizing client forever.
+        assert_eq!(host_layout_resolution(want, Some((2560, 1440))), Some((2560, 1440)));
+        assert_eq!(host_layout_resolution(want, Some((1280, 720))), Some((1280, 720)));
     }
 }
 
